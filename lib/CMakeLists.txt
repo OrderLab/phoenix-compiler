@@ -7,6 +7,7 @@ add_llvm_library( PhoenixAnalysisPass MODULE
     ModuleAnalysis.cpp
     FunctionAnalysis.cpp
     Instrumenter.cpp
+    Injector.cpp
     FieldChain.cpp
     ThreadPool.cpp
     Utils.cpp

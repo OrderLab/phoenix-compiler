@@ -9,7 +9,7 @@ using namespace llvm;
 
 namespace phoenix {
 
-std::string demangleName(std::string mangledName) {
+std::string demangleName(std::string &&mangledName) {
   if (mangledName.size() == 0) return "";
 
   const char *mangled = mangledName.c_str();
@@ -48,9 +48,26 @@ Function *getFunctionByName(std::string name, Module &M) {
 
 std::unique_lock<std::mutex> anyLock(const void *t) {
     static std::mutex self_lock;
-    static std::unordered_map<const void *, std::mutex> lockmap;
+    static std::unordered_map<const void *, std::mutex *> lockmap;
     std::unique_lock<std::mutex> guard(self_lock);
-    return std::unique_lock(lockmap[t]);
+    if (lockmap[t] == nullptr) {
+        lockmap[t] = new std::mutex;
+    }
+    return std::unique_lock(*lockmap[t]);
+}
+
+/* Generate a set of random indices on closed interval [min_value, max_value]. */
+std::unordered_set<size_t> generate_random_set(size_t count, size_t min_value, size_t max_value) {
+    std::unordered_set<size_t> result;
+
+    std::random_device dev;
+    std::mt19937 rng(dev());
+    std::uniform_int_distribution<std::mt19937::result_type> dist(min_value, max_value);
+
+    while (result.size() < count) {
+        result.insert(dist(rng));
+    }
+    return result;
 }
 
 } // namespace phoenix

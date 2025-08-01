@@ -100,7 +100,7 @@ inline bool FieldChain::operator==(const FieldChain &rhs) const {
   return !l && !r;
 }
 
-
+// maybe change to std::optional since we are already >= C++17
 Optional<FieldChain> nest_gep(FieldChain chain, GetElementPtrInst *gep);
 Optional<FieldChain> match_gep(FieldChain chain, const GetElementPtrInst *gep, bool *hit);
 Optional<FieldChain> match_deref(FieldChain chain);

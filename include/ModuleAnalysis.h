@@ -7,13 +7,21 @@ namespace phoenix {
 
 namespace analysis {
 
-class ModuleAnalysis {
-protected:
-    llvm::Module &M;
-    bool parallel = true;
+using TopologyFuncList = std::vector<std::pair<llvm::Function *, size_t>>;
 
-public:
-    ModuleAnalysis(llvm::Module &M, bool parallel) : M(M), parallel(parallel) {}
+struct ModuleAnalysis {
+    llvm::Module &M;
+    /* === Configs === */
+    bool parallel = true;
+    const std::string &scope_root;
+    const std::string &annotate_func;
+    const std::string &indirect_call_info;
+    const std::vector<std::string> &inject_offsets_override;
+    const std::vector<std::string> &inject_parallel_names;
+    const std::string &phx_preset;
+    int inject_count;
+    int debug_set_initial_mode;
+
     bool run();
 };
 

@@ -1,3 +1,4 @@
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/CFG.h"
@@ -5,11 +6,13 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -19,15 +22,21 @@
 
 #include "Instrumenter.h"
 #include "Utils.h"
+#include "FunctionAnalysis.h"
+#include "phx_instrument_compiler_abi.h"
 
 using namespace llvm;
-using std::ranges::reverse_view;
+// C++20:
+// using std::ranges::reverse_view;
 
 namespace phoenix {
 
 namespace instrument {
 
 /* Algorithm to calculate the safe end cut. See `run` for a overall step.
+ *
+ * TODO: replace this with llvm/ADT/SCCIterator.h
+ * https://eli.thegreenplace.net/2013/09/16/analyzing-function-cfgs-with-llvm
  */
 struct SafeCut {
     Function &f;
@@ -98,12 +107,15 @@ private:
         for (auto &bb : f)
             if (!ks[&bb].visited)
                 dfs1(&bb);
-        for (auto &bb : reverse_view(visit_order))
+        // C++20:
+        // for (auto &bb : reverse_view(visit_order))
+        for (auto &bb : iterator_range(visit_order.rbegin(), visit_order.rend())) {
             if (!ks[bb].color) {
                 ++sccCnt;
                 superblock.push_back({});
                 dfs2(bb);
             }
+        }
     }
 
     // returns instrument list
@@ -174,7 +186,8 @@ private:
                     if (pred_color != color && superblock[pred_color].nsucc != 0) {
                         assert(bb->getFirstNonPHI() != nullptr);
                         instrument_list.push_back(bb->getFirstNonPHI());
-                        break;
+                        // don't break early, because one superblock may have
+                        // multiple links to the same predecessor superblock
                     }
                 }
             }
@@ -184,7 +197,7 @@ private:
     }
 
     locked_ostream dbg() const {
-        return debug ? lerrs() : locked_ostream(nulls());
+        return debug ? lerrs() : lnulls();
     }
 
     void debugSuperblocks() const {
@@ -219,8 +232,6 @@ private:
     }
 };
 
-static void dumpDebugInstrumentPoint(std::vector<Instruction *> insts, std::string_view s);
-
 /* Is not the last instruction in the basic block (though typically it is
  * `br`), and is not the last instruction before the `br` or `ret`. */
 static inline bool is_not_last_br(const Instruction *last) {
@@ -231,46 +242,79 @@ static inline bool is_not_last_br(const Instruction *last) {
 }
 
 bool FunctionInstrumenter::instrumentArgumentEffect(
-        const analysis::ArgumentEffect &effect, size_t argno)
+        const analysis::ArgumentEffect &effect, uint8_t argno,
+        std::vector<__phx_taint_pair> *relations)
 {
-    if (effect.taints.empty())
+    // FIXME: should be inserting a safe mark, TBD?
+    if (effect.writes.empty())
         return false;
 
-    assert(argno < max_state_size);
+    assert(argno < state_count);
 
-    prepareFunctionHook();
+    /* === Calculate unsafe_begin === */
 
-    // === instrument start of the unsafe region ===
+    /* Instrument the first modification in each basic block */
+    std::vector<std::pair<Instruction *, bool>> unsafe_starts;
 
-    // instrument the first modification in each basic block
-    std::vector<Instruction *> unsafe_starts;
-    // This is used for end of modification: split tainted basic blocks into
-    // two, so that the unsafe region could end early.
-    // TODO: Alternatively, we can construct a virtual graph based on
-    // instruction range pair, instead of based on BB.
+    /* This is used for unsafe_end: split tainted basic blocks into
+     * two, so that the unsafe region could end early.
+     *
+     * TODO: Alternatively, we can construct a virtual graph based on
+     * instruction range pair, instead of based on BB. */
     std::vector<Instruction *> breakoff_points;
 
     for (auto &bb : f) {
-        Instruction *last = nullptr;
+        Instruction *last_taint = nullptr;
 
         for (auto &inst : bb) {
-            if (effect.taints.contains(&inst)) {
-                if (last == nullptr)
-                    unsafe_starts.push_back(&inst);
-                last = &inst;
+            // C++20:
+            // if (effect.writes.contains(&inst)) {
+            if (effect.writes.find(&inst) != effect.writes.end()) {
+                if (last_taint == nullptr) {
+                    // lerrs() << "Function: " << f.getName() << " checking first_call at " << inst << '\n';
+                    // lerrs() << f << '\n';
+
+                    // bool first_call = inst.getNextNode() && isa<CallBase>(inst.getNextNode());
+                    // FIXME: this is wrong...
+                    // for (1..10)
+                    //     call()
+                    // will set state to FCALL before each call() ...
+                    // If there ever is loop in CFG (superblock), it cannot have
+                    // FCALL or LCALL, but have to set B before it, and E after it.
+
+                    bool first_call = false;
+                    if (auto *call = dyn_cast<CallBase>(&inst)) {
+                        auto called_func = call->getCalledFunction();
+                        // treat instrinsic and external function as INSTRUCTION
+                        // and not function call, because they cannot write to
+                        // flcallee_done.
+                        first_call = !isa<IntrinsicInst>(inst) &&
+                            !(called_func && analysis::isKnownExternalFunctions(*called_func, phx_preset));
+                    }
+
+                    unsafe_starts.push_back({&inst, first_call});
+                    if (first_call) {
+                        // auto callee_arg_no = effect.taint_call_arg.find(&inst)->second;
+                    }
+                }
+                last_taint = &inst;
             }
         }
         // optimization for IR clarity: do not breakoff the last instruction
-        if (is_not_last_br(last))
-            breakoff_points.push_back(last->getNextNode());
+        if (is_not_last_br(last_taint))
+            breakoff_points.push_back(last_taint->getNextNode());
     }
-    if (debugSplitPoint)
-        dumpDebugInstrumentPoint(breakoff_points, "split_point");
+    dumpDebugInstrumentPoint(breakoff_points, "split_point");
 
     for (auto inst : breakoff_points) {
         auto bb = inst->getParent();
         bb->splitBasicBlock(inst);
     }
+
+    /* Start inserting instrumentation
+     * NOTE: This must be called after the analysis above. Otherwise the
+     * "first_call" calculation will be wrong (but it shouldn't be..) */
+    // prepareFunctionHook();
 
     // TODO: use GUI for debugging
     // https://llvm.org/docs/ProgrammersManual.html -> Viewing graphs while debugging code
@@ -278,33 +322,65 @@ bool FunctionInstrumenter::instrumentArgumentEffect(
         lerrs() << "=== splitted function is ===\n" << f << "=== end splitted function ===\n";
 
     // equivalent to:
-    //     state[argno] |= mask;
-    size_t instru_cnt = 0;
-    for (auto inst : unsafe_starts) {
-        auto b = IRBuilder(inst);
-        auto section = b.CreateInBoundsGEP(storage_type, storage, { b.getInt64(0), b.getInt64(argno / 8) });
-        auto suffix = std::to_string(instru_cnt++);
-        auto tmpmask = b.CreateLoad(b.getInt8Ty(), section, "__phx_tmp_mask_" + suffix);
-        auto newmask = b.CreateOr(tmpmask, b.getInt8(1 << (argno % 8)), "__phx_new_mask_" + suffix);
-        b.CreateStore(newmask, section, true);
+    //     state[argno] = STATE;
+
+    Value *slot_arg = nullptr;
+    {
+        auto b = IRBuilder(unified_states_initcall);
+        if (slot_flcallee_done == nullptr)
+            slot_flcallee_done = b.CreateGEP(b.getInt8Ty(), unified_states_ptr, b.getInt64(0), "flcallee_done");
+        slot_arg = b.CreateGEP(b.getInt8Ty(), unified_states_ptr,
+            b.getInt64(argno+1),    // +1 for flcallee_done
+            "argstate" + std::to_string(argno));
     }
 
+    // size_t instru_cnt = 0;
+    for (auto [inst, first_call] : unsafe_starts) {
+        auto b = IRBuilder(inst);
+        if (first_call) {
+            // auto suffix = std::to_string(instru_cnt++);
+            b.CreateStore(b.getInt8(0), slot_flcallee_done, true);
+            b.CreateStore(b.getInt8(FCALL), slot_arg, true);
+            b.SetInsertPoint(inst->getNextNode());
+            b.CreateStore(b.getInt8(MODIFYING), slot_arg, true);
+
+            auto callee_argtaint = effect.callee_relation.find(inst);
+            if (callee_argtaint == effect.callee_relation.end()) {
+                die() << "callee_argtaint not found for " << *inst << '\n';
+            }
+
+            if (relations) {
+                relations->push_back({
+                    .caller_arg = argno,
+                    .callsite = FCALL,
+                    .argtaint = callee_argtaint->second,
+                });
+            }
+        } else {
+            // TODO handle LCALL
+            b.CreateStore(b.getInt8(MODIFYING), slot_arg, true);
+        }
+    }
+
+    // TODO: instrument RCALL
+    // FIXME: we should handle cases where LCALL=RCALL **on one of the path**
+    // instead of checking only number of writes.
+
     // === instrument end of unsafe region ===
-    auto unsafe_ends = SafeCut(f, effect.taints, debugSafeCut).run();
+    auto unsafe_ends = SafeCut(f, effect.writes, debugSafeCut).run();
     // equivalent to:
-    //     state[argno] &= ~mask;
+    //     state[argno] = MODIFY_END;
     // FIXME: add another bit to tell that the function has modified already
     for (auto inst : unsafe_ends) {
         auto b = IRBuilder(inst);
-        auto section = b.CreateInBoundsGEP(storage_type, storage, { b.getInt64(0), b.getInt64(argno / 8) });
-        auto suffix = std::to_string(instru_cnt++);
-        auto tmpmask = b.CreateLoad(b.getInt8Ty(), section, "__phx_tmp_mask_" + suffix);
-        auto newmask = b.CreateAnd(tmpmask, b.getInt8(~(1 << (argno % 8))), "__phx_new_mask_" + suffix);
-        b.CreateStore(newmask, section, true);
+        // lerrs() << "instrumenting unsafe_end at " << *inst << '\n';
+
+        // FIXME: Handle function call
+        b.CreateStore(b.getInt8(MODIFY_END), slot_arg, true);
     }
 
     if (debugInstrumentPoint) {
-        dumpDebugInstrumentPoint(unsafe_starts, "unsafe_start");
+        // dumpDebugInstrumentPoint(unsafe_starts, "unsafe_start");
         dumpDebugInstrumentPoint(unsafe_ends, "safe_cut");
     }
 
@@ -312,54 +388,81 @@ bool FunctionInstrumenter::instrumentArgumentEffect(
 }
 
 void FunctionInstrumenter::prepareFunctionHook() {
+    /* Already created */
     if (storage)
         return;
 
+    /* Create storage at the very beginning */
     auto b = IRBuilder(&f.front().front());
 
     auto guard = anyLock(&M);
 
-    // === Create storage ===
-    // equivalent to `char __phxfuncstate[nbytes] = {0};`
-    // don't forget to initialize
-    size_t nbytes = (max_state_size + 7) / 8;
+    /* Create storage and also initialize.
+     * Equivalent to:
+     * struct __phx_func_state_local local = {
+     *     .func_id = thisfuncid,
+     *     .__unified_states = {0} // length nbytes
+     * };
+     */
+    size_t nbytes = state_count + 1;    // +1 for flcallee_done
+    auto unified_states_type = ArrayType::get(b.getInt8Ty(), nbytes);
+    std::vector<Type*> state_fields = {
+        b.getInt32Ty(),  // func_id
+        unified_states_type // __unified_states[]
+    };
+    storage_type = StructType::get(b.getContext(), state_fields);
+    storage = b.CreateAlloca(storage_type, nullptr, "__phx_func_state_local");
 
-    storage_type = ArrayType::get(b.getInt8Ty(), nbytes);
-    storage = b.CreateAlloca(storage_type, nullptr, "__phx_func_state");
-    b.CreateMemSet(storage, b.getInt8(0), nbytes, MaybeAlign());
+    // Initialize func_id
+    auto func_id_ptr = b.CreateStructGEP(storage_type, storage, 0);
+    static_assert(sizeof(thisfuncid) == 4, "func_id_t size mismatch");
+    b.CreateStore(b.getInt32(thisfuncid), func_id_ptr);
+
+    // Initialize unified_states array to 0
+    unified_states_ptr = b.CreateStructGEP(storage_type, storage, 1);
+    unified_states_initcall = b.CreateMemSet(unified_states_ptr, b.getInt8(0), nbytes, MaybeAlign());
+    unified_states_initcall = unified_states_initcall->getNextNode();
     // lerrs() << "created storage " << *storage << '\n';
     // lerrs() << "created memset " << *memset << '\n';
 
-    // === Register storage to global array ===
-    // equivalent to:
-    //    size_t __phx_old_top = __phx_func_state_top;
-    //    __phx_func_state_array[__phx_old_top] = __phx_func_state;
-    //    __phx_func_state_top = __phx_old_top + 1;
-    //
-    // TODO use thread local storage to store global array
-    // CreateThreadLocalAddress
-    auto phxarray_ptr = M.getGlobalVariable("__phx_func_state_array_ptr");
-    auto phxtop = M.getGlobalVariable("__phx_func_state_top");
-    if (!phxarray_ptr || !phxtop) {
-        lerrs() << "Variable __phx_func_state_array or __phx_func_state_top not found!\n";
-        return;
-    }
+    /* Register storage to global array.
+     * Equivalent to:
+     *    fstate** oldtop = __phx_func_state_top;
+     *    fstate** nexttop = oldtop + 1;
+     *    *nexttop = &local;
+     *    __phx_func_state_top = nexttop;
+     *
+     * TODO use thread local storage to store global array.
+     * CreateThreadLocalAddress */
+
+    // Get or create (declaration only) variable (runtime contains this)
+    auto phxtop = M.getOrInsertGlobal("__phx_func_state_top_tls", b.getPtrTy());
+    assert(phxtop != nullptr && isa<GlobalVariable>(phxtop));
+    dyn_cast<GlobalVariable>(phxtop)->setThreadLocal(true);
     // TODO use platform width: https://stackoverflow.com/a/56864871/7804578
-    auto phxarray = b.CreateLoad(b.getPtrTy(), phxarray_ptr, "__phx_func_state_array");
-    auto oldtop = b.CreateLoad(b.getInt64Ty(), phxtop, "__phx_old_top");
+    auto oldtop = b.CreateLoad(b.getPtrTy(), phxtop, "__phx_old_top");
 
-    auto myslot = b.CreateInBoundsGEP(b.getPtrTy(), phxarray, { oldtop, });
-    b.CreateStore(storage, myslot, true);
+    auto nexttop = b.CreateGEP(b.getPtrTy(), oldtop, b.getInt32(1));
 
-    auto nexttop = b.CreateAdd(oldtop, b.getInt64(1));
+    b.CreateStore(storage, nexttop, true);
+
     b.CreateStore(nexttop, phxtop, true);
 
     // === Reset stack layer before return ===
     // equivalent to:
-    //     __phx_func_state_top = __phx_old_top;
+    //     __phx_func_state_top = oldtop;
     for (auto &inst : instructions(f)) {
         if (isa<ReturnInst>(inst)) {
-            new StoreInst(oldtop, phxtop, true, &inst);
+            b.SetInsertPoint(&inst);
+
+            auto oldstack = b.CreateLoad(b.getPtrTy(), oldtop, "__phx_old_stack");
+            auto oldstack_unified_states_ptr = b.CreateStructGEP(storage_type, oldstack, 1);
+            auto oldstack_flcallee_done = b.CreateGEP(b.getInt8Ty(), oldstack_unified_states_ptr, b.getInt64(0));
+
+            b.CreateStore(b.getInt8(1), oldstack_flcallee_done, true);
+
+            b.CreateStore(oldtop, phxtop, true);
+            break;
         }
     }
 
@@ -368,8 +471,9 @@ void FunctionInstrumenter::prepareFunctionHook() {
 
 // TODO: use GUI for debugging
 // https://llvm.org/docs/ProgrammersManual.html -> Viewing graphs while debugging code
-static void
-dumpDebugInstrumentPoint(std::vector<Instruction *> insts, std::string_view name) {
+void FunctionInstrumenter::dumpDebugInstrumentPoint(std::vector<Instruction *> insts, std::string_view name) const {
+    if (!debugSplitPoint) return;
+
     lerrs() << "=== " << name << " list begin ===\n";
     for (auto inst : insts) {
         auto os = lerrs();

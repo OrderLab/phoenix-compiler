@@ -119,9 +119,10 @@ Optional<FieldChain> match_gep(FieldChain chain, const GetElementPtrInst *gep, b
     return None;
   }
   if (chain.get() == nullptr) {
+    // any dereference to root is always hit
+    *hit = true;
     // Only offset
     if (operands == 2) {
-      *hit = true;
       return chain;
     } else {
       return None;
